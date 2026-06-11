@@ -1,0 +1,14 @@
+{
+  "name": "tranquil-config",
+  "version": "1.0.0",
+  "main": "./src/index",
+  "description": "High level configuration and secrets",
+  "repository": "https://github.com/tranquillabs/tranquil-client",
+  "license": "MIT",
+  "engines": {
+    "atom": "*"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  }
+}
