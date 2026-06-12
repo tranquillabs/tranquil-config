@@ -11,10 +11,7 @@ async function writeConfig() {
   }
 
   try {
-    const configData = {
-      posthog_key: keys[environment].posthog_key,
-      github_token: keys[environment].github_token,
-    };
+    const configData = {};
 
     fs.writeFile('./config.json', JSON.stringify(configData, null, 2), {}, () => {});
   } catch (error) {
