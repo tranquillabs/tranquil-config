@@ -2,3 +2,5 @@ src/generated
 src/generated/*
 .env
 config.json
+.DS_Store
+node_modules
