@@ -1,2 +1,2 @@
 '.platform-darwin atom-workspace':
-  'cmd-b': 'tree-view:toggle'
+  'cmd-b': 'tree-view:toggle-focus'

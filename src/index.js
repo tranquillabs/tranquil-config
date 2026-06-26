@@ -36,6 +36,11 @@ module.exports = {
 
     atom.packages.disablePackage('background-tips')
 
+    document.addEventListener('mousedown', (event) => {
+      const treeView = event.target.closest('.tree-view')
+      if (treeView) treeView.focus()
+    }, true)
+
     atom.commands.onDidDispatch((event) => {
       if (event.type === 'command-palette:toggle' && !mruInstalled) {
         installMRU()
