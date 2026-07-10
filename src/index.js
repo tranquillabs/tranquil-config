@@ -32,6 +32,8 @@ module.exports = {
     atom.config.setDefaults('tree-view', {
       hideIgnoredNames: true,
       hideVcsIgnoredFiles: true,
+      autoReveal: true,      // sync tree selection with the active tab
+      focusOnReveal: false,  // keep keyboard focus in the editor when revealing
     })
 
     atom.packages.disablePackage('background-tips')
