@@ -1,0 +1,13 @@
+{
+  "menu": [
+    {
+      "label": "View",
+      "submenu": [
+        {
+          "label": "Toggle File Sync",
+          "command": "tranquil-config:toggle-tree-view-sync"
+        }
+      ]
+    }
+  ]
+}
