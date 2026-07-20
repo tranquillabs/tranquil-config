@@ -218,8 +218,162 @@ function patchTreeView() {
   return true
 }
 
+// Build the content for our top-level "Tranquil" settings tab. We reuse core
+// settings-view's own SettingsPanel (which auto-renders config-bound controls
+// for a whole namespace, and — since it emits the same markup as Core/Editor —
+// gets themed for free by the business themes). SettingsPanel has destroy() but
+// not show()/focus(), so we wrap it in a `.panels-item` shell that satisfies the
+// panel contract settings-view expects (element + show/focus/destroy), mirroring
+// core's general-panel.js.
+//
+// The require is lazy + guarded: it only runs when the tab is first opened, and
+// resolves settings-view by its installed path rather than a bare module id, so a
+// missing/moved dependency degrades to "no Tranquil tab" instead of throwing.
+function createTranquilSettingsPanel() {
+  const svPath = atom.packages.resolvePackagePath('settings-view')
+  if (!svPath) return null
+  const mod = require(path.join(svPath, 'lib', 'settings-panel'))
+  const SettingsPanel = mod.default || mod
+
+  // settings-view clamps integer fields to the schema's minimum/maximum on every
+  // keystroke pause and rewrites the input, so a value can't be typed freely
+  // (settings-panel.js reads the schema live in its change handler). Strip those
+  // bounds off the live schema so the field accepts any value.
+  const durationSchema = atom.config.getSchema('tranquil.toastDuration')
+  if (durationSchema) {
+    delete durationSchema.minimum
+    delete durationSchema.maximum
+  }
+  const settingsPanel = new SettingsPanel({
+    namespace: 'tranquil',
+    icon: 'gear',
+    title: 'Tranquil Settings',
+  })
+
+  const element = document.createElement('div')
+  element.classList.add('panels-item', 'tranquil-settings')
+  element.tabIndex = 0
+  element.appendChild(settingsPanel.element)
+
+  // Match the main-view.html form spec: the description reads as a `.form-hint`,
+  // which sits BELOW the input. Core renders it above (inside the label), so move
+  // each setting's description to the end of its control-group (after the input).
+  // (Styling for this layout is scoped to `.tranquil-settings` in the theme.)
+  element.querySelectorAll('.control-group').forEach((group) => {
+    const description = group.querySelector('.setting-description')
+    const controls = group.querySelector('.controls')
+    if (description && controls) group.appendChild(description)
+  })
+
+  // Replace the auto-generated Toast Duration mini-editor with a native number
+  // input (integer value + increment/decrement steppers), bound to config, and
+  // add a "Test" button beside it that previews a toast at the current value.
+  let durationConfigSub = null
+  const durationEditor = element.querySelector('[id="tranquil.toastDuration"]')
+  const durationControls = durationEditor && durationEditor.closest('.controls')
+  if (durationControls) {
+    // The field shows whole SECONDS (a friendly integer for the stepper); the
+    // stored config value stays in milliseconds, which is what the toasts read.
+    const msToSeconds = (ms) => Math.max(1, Math.round((ms || 3000) / 1000))
+    const numberInput = document.createElement('input')
+    numberInput.type = 'number'
+    // `native-key-bindings` lets standard editing keys (backspace, select-all,
+    // copy/paste, arrows) reach the input instead of being captured by Atom's keymap.
+    numberInput.classList.add('tranquil-number-input', 'native-key-bindings')
+    numberInput.min = '1'
+    numberInput.step = '1'
+    numberInput.value = String(msToSeconds(atom.config.get('tranquil.toastDuration')))
+    numberInput.addEventListener('input', () => {
+      const seconds = parseInt(numberInput.value, 10)
+      if (Number.isFinite(seconds)) atom.config.set('tranquil.toastDuration', seconds * 1000)
+    })
+    // Reflect external config changes, but don't fight the user while they type.
+    durationConfigSub = atom.config.onDidChange('tranquil.toastDuration', ({ newValue }) => {
+      if (document.activeElement !== numberInput) numberInput.value = String(msToSeconds(newValue))
+    })
+
+    const editorContainer = durationEditor.closest('.editor-container') || durationEditor
+    editorContainer.replaceWith(numberInput)
+
+    // "Test" previews a toast at the CURRENT setting. Dismiss any prior preview
+    // and label each toast with the duration so the notifications view never
+    // de-dupes it into a stale toast (which reads as "the value has no effect").
+    let previewToast = null
+    const testButton = document.createElement('button')
+    testButton.classList.add('btn', 'tranquil-toast-test')
+    testButton.textContent = 'Test'
+    testButton.addEventListener('click', () => {
+      // Read the field directly so the preview always matches what's shown (no
+      // dependency on the config write from the input's change event landing first).
+      const seconds = parseInt(numberInput.value, 10)
+      const ms = (Number.isFinite(seconds) && seconds > 0 ? seconds : 3) * 1000
+      if (previewToast) previewToast.dismiss()
+      previewToast = atom.notifications.addInfo(`Toast preview — ${ms / 1000}s (${ms} ms)`, {
+        dismissable: true,
+      })
+      const shown = previewToast
+      setTimeout(() => shown.dismiss(), ms)
+    })
+    durationControls.appendChild(testButton)
+  }
+
+  return {
+    element,
+    show() { element.style.display = '' },
+    focus() { element.focus() },
+    destroy() {
+      if (durationConfigSub) durationConfigSub.dispose()
+      if (settingsPanel.destroy) settingsPanel.destroy()
+      element.remove()
+    },
+  }
+}
+
+// Register the "Tranquil" tab on a settings-view instance (idempotent).
+function addTranquilPanel(settingsView) {
+  if (settingsView.panelCreateCallbacks && settingsView.panelCreateCallbacks['Tranquil']) return
+  settingsView.addCorePanel('Tranquil', 'gear', () => createTranquilSettingsPanel())
+}
+
 module.exports = {
   activate() {
+    // Tranquil's own config namespace (`tranquil.*`), surfaced in the "Tranquil"
+    // settings tab below. Registered here (not via package.json configSchema) so
+    // the keys live under `tranquil.*` rather than the package name.
+    // NB: no `minimum`/`maximum` here on purpose. settings-view clamps integer
+    // fields to those bounds on every keystroke pause and rewrites the input,
+    // which makes typing a new value impossible (intermediate digits below the
+    // min snap back). We enforce a sane floor where the value is consumed instead.
+    atom.config.setSchema('tranquil', {
+      type: 'object',
+      properties: {
+        toastDuration: {
+          type: 'integer',
+          default: 3000,
+          title: 'Toast Duration',
+          description:
+            'How long transient corner notifications (toasts) stay on screen before auto-hiding, in seconds.',
+        },
+      },
+    })
+
+    // The `notify()` helpers in tranquil-automations / tranquil-browser read
+    // `tranquil.toastDuration` directly. Bridge it one-way to the core
+    // notifications timeout too, so the handful of direct `atom.notifications.add*`
+    // callers (tranquil-drag-drop, tranquil-window-color) honor the same setting.
+    // Clamp to the notifications schema's own minimum (1000) so the write sticks.
+    atom.config.observe('tranquil.toastDuration', (value) => {
+      const ms = Math.max(1000, Number(value) || 3000)
+      atom.config.set('notifications.defaultTimeout', ms)
+    })
+
+    // Add a top-level "Tranquil" tab to every settings-view instance as it opens.
+    atom.workspace.observePaneItems((item) => {
+      if (item && typeof item.addCorePanel === 'function' && item.constructor && item.constructor.name === 'SettingsView') {
+        addTranquilPanel(item)
+      }
+    })
+
     atom.config.setDefaults('tree-view', {
       hideIgnoredNames: true,
       hideVcsIgnoredFiles: true,
@@ -252,7 +406,7 @@ module.exports = {
           const next = !atom.config.get('tree-view.autoReveal')
           atom.config.set('tree-view.autoReveal', next)
           const n = atom.notifications.addInfo(`Tree view sync ${next ? 'on' : 'off'}`, {dismissable: true})
-          setTimeout(() => n.dismiss(), 1500)
+          setTimeout(() => n.dismiss(), atom.config.get('tranquil.toastDuration') || 3000)
         },
       },
     })
