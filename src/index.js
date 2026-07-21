@@ -1,4 +1,3 @@
-const fs = require('fs')
 const path = require('path')
 
 const commandHistory = []
@@ -109,53 +108,6 @@ function installMRU() {
 // All tree-view modifications live here in tranquil-config (not automations).
 // tree-view is third-party, so we patch the live instance's methods.
 
-// Map an http(s) URL back to the project `.url` bookmark file that points at it,
-// by matching each file's `URL=` line (same match the browser's .url opener
-// uses). Cached for a few seconds so tab switching doesn't re-read the tree on
-// every activation.
-let urlIndex = null
-let urlIndexAt = 0
-
-function buildUrlIndex() {
-  const index = new Map()
-  const walk = (dir, depth) => {
-    if (depth > 6) return
-    let entries
-    try {
-      entries = fs.readdirSync(dir, {withFileTypes: true})
-    } catch (e) {
-      return
-    }
-    for (const entry of entries) {
-      if (entry.name.startsWith('.') || entry.name === 'node_modules') continue
-      const full = path.join(dir, entry.name)
-      if (entry.isDirectory()) {
-        walk(full, depth + 1)
-      } else if (entry.name.endsWith('.url')) {
-        try {
-          const match = fs.readFileSync(full, 'utf8').match(/^URL=(.+)$/im)
-          if (match) index.set(match[1].trim().replace(/\/$/, ''), full)
-        } catch (e) {
-          // Unreadable .url — skip it.
-        }
-      }
-    }
-  }
-  for (const root of atom.project.getPaths()) walk(root, 0)
-  return index
-}
-
-function resolveUrlFile(url) {
-  if (!url || url === 'tranquil-browser://blank') return null
-  const key = String(url).replace(/\/$/, '')
-  const now = Date.now()
-  if (!urlIndex || now - urlIndexAt > 5000) {
-    urlIndex = buildUrlIndex()
-    urlIndexAt = now
-  }
-  return urlIndex.get(key) || null
-}
-
 // Revealing/selecting a file never scrolls the pane horizontally. Upstream
 // scrollToEntry uses scrollIntoViewIfNeeded, which scrolls BOTH axes — a
 // filename wider than the pane yanks the view right. Restore the horizontal
@@ -172,49 +124,12 @@ function patchTreeViewNoHorizontalScroll(treeView) {
   treeView.__tranquilNoHScroll = true
 }
 
-// Upstream tree-view clears the selection whenever the active pane item has no
-// file path (selectActiveFile → deselect()). Tranquil uses pathless tabs heavily
-// (browser tabs), so switching to one wipes the tree highlight — and single-
-// clicking a file appears to need two clicks. Patch selectActiveFile to keep the
-// current selection when there's no active project file, and gate it on the
-// autoReveal "file sync" toggle.
-function patchTreeViewKeepSelection(treeView) {
-  if (treeView.__tranquilKeepSelection) return
-  const original = treeView.selectActiveFile.bind(treeView)
-  treeView.selectActiveFile = function () {
-    // "File sync" (tranquil-config:toggle-tree-view-sync) is gated on
-    // tree-view.autoReveal. Upstream calls selectActiveFile unconditionally on
-    // every active-pane-item change, so the highlight follows the active tab even
-    // with autoReveal off — meaning the toggle never truly turned sync off. When
-    // it's off, leave the current selection alone.
-    if (!atom.config.get('tree-view.autoReveal')) return
-    // A browser tab restored/reopened without its source .url reports no path, so
-    // the tree can't follow it. Reverse-map the tab's URL back to its .url
-    // bookmark and restore the link so getActivePath() (and revealActiveFile) can
-    // highlight/expand it. tranquil-browser now persists filePath, so this only
-    // backfills legacy/pre-fix tabs.
-    const item = atom.workspace.getCenter().getActivePaneItem()
-    if (item && item.getURL && !item.getPath?.()) {
-      const mapped = resolveUrlFile(item.getURL())
-      if (mapped) item.filePath = mapped
-    }
-    const activeFilePath = this.getActivePath()
-    // No active project file (e.g. a blank browser tab) → keep the current
-    // selection rather than clearing it. If the file exists but isn't rendered
-    // yet (collapsed parent), autoReveal handles expand + select.
-    if (!activeFilePath || !this.entryForPath(activeFilePath)) return
-    return original()
-  }
-  treeView.__tranquilKeepSelection = true
-}
-
 // Apply every tree-view patch. Returns true once tree-view is available (patched
 // or already was), false if it isn't active yet.
 function patchTreeView() {
   const treeView = atom.packages.getActivePackage('tree-view')?.mainModule?.treeView
   if (!treeView) return false
   patchTreeViewNoHorizontalScroll(treeView)
-  patchTreeViewKeepSelection(treeView)
   return true
 }
 
@@ -331,8 +246,44 @@ function createTranquilSettingsPanel() {
 
 // Register the "Tranquil" tab on a settings-view instance (idempotent).
 function addTranquilPanel(settingsView) {
-  if (settingsView.panelCreateCallbacks && settingsView.panelCreateCallbacks['Tranquil']) return
+  const menu = settingsView.refs && settingsView.refs.panelMenu
+  // Idempotent: bail if the callback, the built panel, or the nav item already exist.
+  const alreadyAdded =
+    (settingsView.panelCreateCallbacks && settingsView.panelCreateCallbacks['Tranquil']) ||
+    (settingsView.panelsByName && settingsView.panelsByName['Tranquil']) ||
+    (menu && menu.querySelector('li[name="Tranquil"]'))
+  if (alreadyAdded) return
+
   settingsView.addCorePanel('Tranquil', 'gear', () => createTranquilSettingsPanel())
+
+  // addCorePanel appends the nav item just before the menu separator, so where it
+  // lands depends on whether we run before or after settings-view's own
+  // initializePanels() (scheduled on process.nextTick) — a race that put the tab at
+  // the top or bottom unpredictably. Pin it to the top: move its <li> to the front
+  // of the menu. Core panels added later still insert before the separator (i.e.
+  // after our item), so it stays first regardless of ordering.
+  const item = menu && menu.querySelector('li[name="Tranquil"]')
+  if (menu && item && item !== menu.firstElementChild) {
+    menu.insertBefore(item, menu.firstElementChild)
+  }
+
+  // Land on the Tranquil tab by default whenever Settings is opened (including a
+  // window reload, where the pane is restored and already showing "Core"). The
+  // only thing we respect is an explicit deep-link open — atom://config/<panel>,
+  // e.g. "view this package's settings" — which settings-view records as an
+  // options.uri on the pending/active panel.
+  const pending = settingsView.activePanel || settingsView.deferredPanel
+  const targetUri = pending && pending.options && pending.options.uri
+  const isDeepLink = targetUri && /config\/[a-z]/i.test(targetUri)
+  if (!isDeepLink) {
+    if (settingsView.activePanel) {
+      // Already initialized (restored/open) → switch to Tranquil now.
+      settingsView.showPanel('Tranquil')
+    } else {
+      // Fresh open, before initializePanels() → it will show this deferred panel.
+      settingsView.deferredPanel = { name: 'Tranquil' }
+    }
+  }
 }
 
 module.exports = {
@@ -377,8 +328,6 @@ module.exports = {
     atom.config.setDefaults('tree-view', {
       hideIgnoredNames: true,
       hideVcsIgnoredFiles: true,
-      autoReveal: true,      // sync tree selection with the active tab
-      focusOnReveal: false,  // keep keyboard focus in the editor when revealing
     })
 
     atom.packages.disablePackage('background-tips')
@@ -396,20 +345,6 @@ module.exports = {
         }
       })
     }
-
-    // Toggle the tree-view ↔ active-tab "file sync" (gated on autoReveal, which
-    // patchTreeViewKeepSelection honors). Also surfaced in the View menu.
-    atom.commands.add('atom-workspace', {
-      'tranquil-config:toggle-tree-view-sync': {
-        displayName: 'Tree View: Toggle File Sync',
-        didDispatch: () => {
-          const next = !atom.config.get('tree-view.autoReveal')
-          atom.config.set('tree-view.autoReveal', next)
-          const n = atom.notifications.addInfo(`Tree view sync ${next ? 'on' : 'off'}`, {dismissable: true})
-          setTimeout(() => n.dismiss(), atom.config.get('tranquil.toastDuration') || 3000)
-        },
-      },
-    })
 
     // Prefer wrapping the palette eagerly — before its first open — so the first
     // toggle is already filtered (no flash). If it isn't reachable yet, retry
