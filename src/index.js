@@ -1,4 +1,41 @@
 const path = require('path')
+const { ipcRenderer, shell } = require('electron')
+
+// --- Markdown file links ---------------------------------------------------
+// Open the target of a Markdown link. Relative paths resolve against the source
+// document's directory and open in the editor; http(s) links open as a Tranquil
+// browser tab (via the workspace opener); other schemes are handed to the OS.
+function openMarkdownLinkTarget(target, sourcePath) {
+  if (!target) return
+  target = target.trim().replace(/^<([\s\S]*)>$/, '$1') // strip surrounding <>
+  if (target.startsWith('#')) return // in-page anchor — nothing to open
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(target)
+  if (scheme) {
+    const name = scheme[1].toLowerCase()
+    if (name === 'http' || name === 'https' || name === 'atom') {
+      atom.workspace.open(target)
+    } else {
+      shell.openExternal(target)
+    }
+    return
+  }
+  const base = sourcePath
+    ? path.dirname(sourcePath)
+    : atom.project.getPaths()[0] || ''
+  const filePart = decodeURI(target.split('#')[0])
+  if (filePart) atom.workspace.open(path.resolve(base, filePart))
+}
+
+// Find the inline Markdown link `[text](target)` whose span covers `column`.
+// Returns the target string, or null.
+function markdownLinkTargetAt(lineText, column) {
+  const re = /\[[^\]]*\]\(([^)]+)\)/g
+  let m
+  while ((m = re.exec(lineText)) !== null) {
+    if (column >= m.index && column <= m.index + m[0].length) return m[1]
+  }
+  return null
+}
 
 const commandHistory = []
 let mruInstalled = false
@@ -288,6 +325,112 @@ function addTranquilPanel(settingsView) {
 
 module.exports = {
   activate() {
+    // "File → New Default Window" → ask the main process to seed (if needed) and
+    // open the bundled example project in a new window. Classic Electron IPC,
+    // matching the browser's new-window command.
+    atom.commands.add('atom-workspace', {
+      'tranquil:new-default-window': () =>
+        ipcRenderer.send('tranquil:new-default-window'),
+    })
+
+    // Place "New Default Window" as the SECOND File-menu item (right after "New
+    // Window"). A package `menus/*.cson` contribution can't do this — the app-menu
+    // merge only appends to the bottom — so insert it into the menu template
+    // directly. Idempotent; located by the `application:new-window` command so it
+    // works across darwin/linux/win32 without matching the (accelerator-decorated)
+    // "File" label.
+    const placeNewDefaultWindowItem = () => {
+      const fileMenu = atom.menu.template.find(
+        (m) =>
+          Array.isArray(m.submenu) &&
+          m.submenu.some((i) => i && i.command === 'application:new-window')
+      )
+      if (!fileMenu) return
+      if (
+        fileMenu.submenu.some(
+          (i) => i && i.command === 'tranquil:new-default-window'
+        )
+      )
+        return
+      const afterIdx = fileMenu.submenu.findIndex(
+        (i) => i && i.command === 'application:new-window'
+      )
+      fileMenu.submenu.splice(afterIdx + 1, 0, {
+        label: 'New Default Window',
+        command: 'tranquil:new-default-window',
+      })
+      atom.menu.update()
+    }
+    // Run now (template is usually built by activation time) and again once all
+    // initial packages have loaded, so it lands regardless of menu-load ordering.
+    placeNewDefaultWindowItem()
+    atom.packages.onDidActivateInitialPackages(placeNewDefaultWindowItem)
+
+    // Let editor tabs be dragged into the right/bottom docks, matching browser
+    // tabs. Core `TextEditor.getAllowedLocations()` returns `['center']`, so a
+    // dock refuses an editor on drop (`isItemAllowed()` in dock.js). Override it
+    // per instance to the same set browser tabs use — left stays reserved for the
+    // tree-view.
+    atom.workspace.observeTextEditors((editor) => {
+      editor.getAllowedLocations = () => ['center', 'right', 'bottom']
+
+      // Cmd/Ctrl-click a Markdown link in the SOURCE to open its target. Only
+      // fires on `.md` files and only when the click lands on a link, so plain
+      // cmd-click (multi-cursor) is unaffected elsewhere.
+      const el = atom.views.getView(editor)
+      if (!el || el.__tranquilMdLinks) return
+      el.__tranquilMdLinks = true
+      el.addEventListener(
+        'mousedown',
+        (event) => {
+          if (event.button !== 0 || !(event.metaKey || event.ctrlKey)) return
+          const filePath = editor.getPath && editor.getPath()
+          if (!filePath || !/\.(md|markdown|mdown|mkd)$/i.test(filePath)) return
+          const component = el.getComponent && el.getComponent()
+          if (!component) return
+          const screenPos = component.screenPositionForMouseEvent(event)
+          const pos = editor.bufferPositionForScreenPosition(screenPos)
+          const target = markdownLinkTargetAt(
+            editor.lineTextForBufferRow(pos.row) || '',
+            pos.column
+          )
+          if (!target) return
+          event.preventDefault()
+          event.stopPropagation()
+          openMarkdownLinkTarget(target, filePath)
+        },
+        true // capture phase, to beat the editor's own mousedown handling
+      )
+    })
+
+    // Click a link in a Markdown PREVIEW to open its target. Core
+    // markdown-preview attaches no anchor handler, so relative file links are
+    // dead; intercept them and route through the same opener.
+    atom.workspace.observePaneItems((item) => {
+      if (
+        !item ||
+        !item.element ||
+        !item.constructor ||
+        item.constructor.name !== 'MarkdownPreviewView' ||
+        item.element.__tranquilMdLinks
+      )
+        return
+      item.element.__tranquilMdLinks = true
+      item.element.addEventListener('click', (event) => {
+        const anchor =
+          event.target &&
+          event.target.closest &&
+          event.target.closest('a[href]')
+        if (!anchor) return
+        const href = anchor.getAttribute('href')
+        if (!href || href.startsWith('#')) return // let in-page anchors scroll
+        event.preventDefault()
+        const sourcePath =
+          (item.getPath && item.getPath()) || item.filePath || null
+        openMarkdownLinkTarget(href, sourcePath)
+      })
+    })
+
     // Tranquil's own config namespace (`tranquil.*`), surfaced in the "Tranquil"
     // settings tab below. Registered here (not via package.json configSchema) so
     // the keys live under `tranquil.*` rather than the package name.
