@@ -161,12 +161,26 @@ function patchTreeViewNoHorizontalScroll(treeView) {
   treeView.__tranquilNoHScroll = true
 }
 
+// Rename the panel/tab title from upstream's "Project" to "Workspace". The tab
+// reads getTitle() once at render and only re-renders on onDidChangeTitle, which
+// tree-view never emits — so override getTitle for future renders and refresh
+// any already-rendered tab title in the DOM.
+function patchTreeViewTitle(treeView) {
+  if (treeView.__tranquilTitle) return
+  treeView.getTitle = function () { return 'Workspace' }
+  for (const el of document.querySelectorAll('.tab > .title')) {
+    if (el.textContent === 'Project') el.textContent = 'Workspace'
+  }
+  treeView.__tranquilTitle = true
+}
+
 // Apply every tree-view patch. Returns true once tree-view is available (patched
 // or already was), false if it isn't active yet.
 function patchTreeView() {
   const treeView = atom.packages.getActivePackage('tree-view')?.mainModule?.treeView
   if (!treeView) return false
   patchTreeViewNoHorizontalScroll(treeView)
+  patchTreeViewTitle(treeView)
   return true
 }
 
@@ -207,14 +221,107 @@ function createTranquilSettingsPanel() {
   element.tabIndex = 0
   element.appendChild(settingsPanel.element)
 
-  // Match the main-view.html form spec: the description reads as a `.form-hint`,
-  // which sits BELOW the input. Core renders it above (inside the label), so move
-  // each setting's description to the end of its control-group (after the input).
-  // (Styling for this layout is scoped to `.tranquil-settings` in the theme.)
+  // Surface the UI theme picker (normally buried in settings-view's Themes panel)
+  // at the top of Tranquil Settings. Self-contained: reads/writes core.themes
+  // directly, so it needs nothing from settings-view. Built with the same
+  // `.control-group` markup core emits for an enum setting, so it's themed for
+  // free and the description-reorder below treats it like any other setting.
+  let uiThemeSub = null
+  {
+    // "tranquil-business-dark" → "Tranquil Business Dark" (mirrors settings-view's
+    // undasherize/uncamelcase for theme menu labels).
+    const themeTitle = (name) =>
+      name
+        .replace(/-(ui|syntax)/g, '')
+        .replace(/-theme$/g, '')
+        .split('-')
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ')
+    const activeThemeOfKind = (kind) => {
+      for (const { name, metadata } of atom.themes.getActiveThemes()) {
+        if (metadata.theme === kind) return name
+      }
+      return null
+    }
+
+    // Mirror the structure settings-view emits for a setting (see
+    // elementForEditor): `label.control-label` (title + description) as a direct
+    // child of the control-group, then a separate `.controls` holding the input.
+    // This is what stacks the label above the field and lets the description
+    // reorder below — so the picker lays out exactly like Toast Duration.
+    const group = document.createElement('div')
+    group.classList.add('control-group', 'tranquil-ui-theme')
+
+    const label = document.createElement('label')
+    label.classList.add('control-label')
+    const title = document.createElement('div')
+    title.classList.add('setting-title')
+    title.textContent = 'UI Theme'
+    const description = document.createElement('div')
+    description.classList.add('setting-description')
+    description.textContent =
+      'This styles the tabs, status bar, tree view, and dropdowns'
+    label.appendChild(title)
+    label.appendChild(description)
+    group.appendChild(label)
+
+    const controls = document.createElement('div')
+    controls.classList.add('controls')
+    group.appendChild(controls)
+
+    const select = document.createElement('select')
+    select.classList.add('form-control')
+    const populate = () => {
+      const active = activeThemeOfKind('ui')
+      select.innerHTML = ''
+      // Only offer Tranquil's own UI themes (business light/dark), not every
+      // loaded UI theme — the tab is for Tranquil's curated look.
+      const uiThemes = atom.themes
+        .getLoadedThemes()
+        .filter(
+          ({ name, metadata }) =>
+            metadata.theme === 'ui' && name.startsWith('tranquil-business-')
+        )
+        .sort((a, b) => a.name.localeCompare(b.name))
+      for (const { name } of uiThemes) {
+        const option = document.createElement('option')
+        option.value = name
+        option.textContent = themeTitle(name)
+        if (name === active) option.selected = true
+        select.appendChild(option)
+      }
+    }
+    populate()
+    // Setting core.themes = [uiTheme, syntaxTheme] preserves the active syntax
+    // theme (settings-view's Themes panel writes the pair the same way).
+    select.addEventListener('change', () => {
+      const themes = [select.value, activeThemeOfKind('syntax')].filter(Boolean)
+      if (themes.length) atom.config.set('core.themes', themes)
+    })
+    // Reflect theme changes made elsewhere (e.g. the Themes panel).
+    uiThemeSub = atom.themes.onDidChangeActiveThemes(() => populate())
+    controls.appendChild(select)
+
+    const body = settingsPanel.element.querySelector('.section-body')
+    if (body) body.insertBefore(group, body.firstChild)
+    else settingsPanel.element.insertBefore(group, settingsPanel.element.firstChild)
+  }
+
+  // Normalize every setting to ONE consistent vertical layout so all fields line
+  // up — and so settings added over time inherit it for free. Core emits
+  // different markup per control type (the label is sometimes nested inside
+  // `.controls`), which is why fields rendered differently. Hoist the label to the
+  // top of the control-group so it stacks above the control, and keep the
+  // description tucked inside the label (directly under the title) so every
+  // setting reads title → description → control. The stacked layout + shared field
+  // width live in the theme's `.tranquil-settings` rules.
   element.querySelectorAll('.control-group').forEach((group) => {
+    const label = group.querySelector('.control-label')
     const description = group.querySelector('.setting-description')
-    const controls = group.querySelector('.controls')
-    if (description && controls) group.appendChild(description)
+    if (label) group.insertBefore(label, group.firstChild)
+    if (label && description && description.parentElement !== label) {
+      label.appendChild(description)
+    }
   })
 
   // Replace the auto-generated Toast Duration mini-editor with a native number
@@ -275,6 +382,7 @@ function createTranquilSettingsPanel() {
     focus() { element.focus() },
     destroy() {
       if (durationConfigSub) durationConfigSub.dispose()
+      if (uiThemeSub) uiThemeSub.dispose()
       if (settingsPanel.destroy) settingsPanel.destroy()
       element.remove()
     },
