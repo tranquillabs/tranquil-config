@@ -174,6 +174,24 @@ function patchTreeViewTitle(treeView) {
   treeView.__tranquilTitle = true
 }
 
+// Keep the tree-view selection when the active pane item isn't a project file.
+// Upstream selectActiveFile() selects the matching entry when the active item
+// has a path in the tree, but deselects everything otherwise — so activating a
+// browser tab, settings, or any pathless item (e.g. clicking a row in the
+// vertical tab list) wipes the highlight. Preserve it: sync the selection only
+// when the item maps to a real tree entry, leave it alone when it doesn't.
+function patchTreeViewKeepSelection(treeView) {
+  if (treeView.__tranquilKeepSelection) return
+  treeView.selectActiveFile = function () {
+    const activeFilePath = this.getActivePath()
+    if (this.entryForPath(activeFilePath)) {
+      return this.selectEntryForPath(activeFilePath)
+    }
+    // No matching entry — keep the current selection instead of deselecting.
+  }
+  treeView.__tranquilKeepSelection = true
+}
+
 // Apply every tree-view patch. Returns true once tree-view is available (patched
 // or already was), false if it isn't active yet.
 function patchTreeView() {
@@ -181,6 +199,7 @@ function patchTreeView() {
   if (!treeView) return false
   patchTreeViewNoHorizontalScroll(treeView)
   patchTreeViewTitle(treeView)
+  patchTreeViewKeepSelection(treeView)
   return true
 }
 
@@ -439,6 +458,33 @@ module.exports = {
     atom.commands.add('atom-workspace', {
       'tranquil:new-default-window': () =>
         ipcRenderer.send('tranquil:new-default-window'),
+    })
+
+    // Ctrl+Tab always cycles the CENTER's tabs, even when focus is in a dock.
+    // Core `pane:show-next-item` acts on `workspace.getActivePane()`, which
+    // follows the active pane *container* — so clicking the tree-view (left
+    // dock) makes ctrl+tab cycle the dock's single item and appear dead. Target
+    // the center's active pane explicitly. ctrl-tab is bound to these in
+    // keymaps/darwin.cson + keymaps/linux.cson.
+    const cycleCenterItem = (method) => {
+      const pane = atom.workspace.getCenter().getActivePane()
+      if (!pane) return
+      pane[method]()
+      // Move DOM focus into the center pane. Cycling only changes the active
+      // item, not focus — so after ctrl+tab from a dock (tree-view) focus stays
+      // in the dock, and after switching away from a browser guest it can strand
+      // on <body>. Either way, focus sits outside the center: atom-workspace-
+      // scoped keys misfire (cmd-t would open the new tab in the focused dock)
+      // and browser guest keyHandler keys (cmd-t/cmd-w) never fire. Focusing the
+      // pane delegates to the active item view (and, via model.focus(), makes the
+      // center the active container so the browser focuses its guest webview).
+      atom.views.getView(pane).focus()
+    }
+    atom.commands.add('atom-workspace', {
+      'tranquil:show-next-item-in-center': () =>
+        cycleCenterItem('activateNextItem'),
+      'tranquil:show-previous-item-in-center': () =>
+        cycleCenterItem('activatePreviousItem'),
     })
 
     // Place "New Default Window" as the SECOND File-menu item (right after "New
