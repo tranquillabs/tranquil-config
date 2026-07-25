@@ -1,6 +1,23 @@
 const path = require('path')
 const { ipcRenderer, shell } = require('electron')
 
+// --- Browser User-Agent presets --------------------------------------------
+// Options for the "Browser User-Agent" combobox in the Tranquil settings tab
+// (and the schema default). CHROME is the clean default: the app's own UA with
+// the Electron/Tranquil tokens stripped, so browser tabs present as plain Chrome,
+// derived at load so it tracks the bundled Chromium across upgrades — no version
+// string to rot. Edge reuses that Chromium version; Firefox/Safari are fixed
+// strings (their engine/version tokens can't be derived from Chromium — bump when
+// they drift).
+const BROWSER_UA_CHROME = navigator.userAgent.replace(/ (?:Tranquil|Electron)\/\S+/g, '')
+const BROWSER_UA_CHROME_VER = (BROWSER_UA_CHROME.match(/Chrome\/([\d.]+)/) || [, '124.0.0.0'])[1]
+const BROWSER_UA_PRESETS = [
+  { label: 'Chrome', value: BROWSER_UA_CHROME },
+  { label: 'Firefox', value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:126.0) Gecko/20100101 Firefox/126.0' },
+  { label: 'Edge', value: `${BROWSER_UA_CHROME} Edg/${BROWSER_UA_CHROME_VER}` },
+  { label: 'Safari', value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15' },
+]
+
 // --- Markdown file links ---------------------------------------------------
 // Open the target of a Markdown link. Relative paths resolve against the source
 // document's directory and open in the editor; http(s) links open as a Tranquil
@@ -395,12 +412,108 @@ function createTranquilSettingsPanel() {
     durationControls.appendChild(testButton)
   }
 
+  // Replace the auto-generated Browser User-Agent text field with an editable
+  // combobox: type any value, or pick a Chrome/Firefox/Edge/Safari preset. The
+  // schema key is a plain string (no enum) so custom values are accepted; the
+  // preset list is our own DOM because stock settings-view can't render an
+  // editable dropdown.
+  let uaConfigSub = null
+  let uaDocMouseDown = null
+  const uaEditor = element.querySelector('[id="tranquil.browserUserAgent"]')
+  const uaControls = uaEditor && uaEditor.closest('.controls')
+  if (uaControls) {
+    const KEY = 'tranquil.browserUserAgent'
+
+    const combo = document.createElement('div')
+    combo.classList.add('tq-ua-combobox')
+
+    const input = document.createElement('input')
+    input.type = 'text'
+    // `native-key-bindings` lets standard editing keys (backspace, select-all,
+    // copy/paste) reach the field instead of being captured by Atom's keymap.
+    input.classList.add('form-input', 'native-key-bindings')
+    input.setAttribute('role', 'combobox')
+    input.setAttribute('aria-autocomplete', 'list')
+    input.setAttribute('aria-expanded', 'false')
+    input.setAttribute('aria-controls', 'tq-ua-listbox')
+    input.setAttribute('spellcheck', 'false')
+    input.value = atom.config.get(KEY) || ''
+
+    const toggle = document.createElement('button')
+    toggle.type = 'button'
+    toggle.classList.add('tq-ua-toggle')
+    toggle.textContent = '▾'
+    toggle.tabIndex = -1
+    toggle.setAttribute('aria-label', 'Choose a preset browser')
+
+    const list = document.createElement('ul')
+    list.classList.add('tq-ua-presets')
+    list.id = 'tq-ua-listbox'
+    list.setAttribute('role', 'listbox')
+    list.hidden = true
+    for (const preset of BROWSER_UA_PRESETS) {
+      const li = document.createElement('li')
+      li.setAttribute('role', 'option')
+      li.dataset.ua = preset.value
+      li.textContent = preset.label
+      list.appendChild(li)
+    }
+
+    const openList = () => {
+      list.hidden = false
+      input.setAttribute('aria-expanded', 'true')
+    }
+    const closeList = () => {
+      list.hidden = true
+      input.setAttribute('aria-expanded', 'false')
+    }
+
+    toggle.addEventListener('click', () => {
+      if (list.hidden) openList()
+      else closeList()
+      input.focus()
+    })
+    input.addEventListener('focus', openList)
+    // Write on change (blur / Enter), not on every keystroke, to avoid config churn.
+    input.addEventListener('change', () => atom.config.set(KEY, input.value.trim()))
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeList()
+    })
+    // mousedown (not click) so the pick lands before the input's blur closes the list.
+    list.addEventListener('mousedown', (e) => {
+      const li = e.target.closest('li[role="option"]')
+      if (!li) return
+      e.preventDefault()
+      input.value = li.dataset.ua
+      atom.config.set(KEY, li.dataset.ua)
+      closeList()
+    })
+    // Close when a click/focus lands outside the combobox.
+    uaDocMouseDown = (e) => {
+      if (!combo.contains(e.target)) closeList()
+    }
+    document.addEventListener('mousedown', uaDocMouseDown, true)
+
+    // Reflect external config changes, but don't fight the user while they type.
+    uaConfigSub = atom.config.onDidChange(KEY, ({ newValue }) => {
+      if (document.activeElement !== input) input.value = newValue || ''
+    })
+
+    combo.appendChild(input)
+    combo.appendChild(toggle)
+    combo.appendChild(list)
+    const editorContainer = uaEditor.closest('.editor-container') || uaEditor
+    editorContainer.replaceWith(combo)
+  }
+
   return {
     element,
     show() { element.style.display = '' },
     focus() { element.focus() },
     destroy() {
       if (durationConfigSub) durationConfigSub.dispose()
+      if (uaConfigSub) uaConfigSub.dispose()
+      if (uaDocMouseDown) document.removeEventListener('mousedown', uaDocMouseDown, true)
       if (uiThemeSub) uiThemeSub.dispose()
       if (settingsPanel.destroy) settingsPanel.destroy()
       element.remove()
@@ -601,6 +714,17 @@ module.exports = {
           title: 'Toast Duration',
           description:
             'How long transient corner notifications (toasts) stay on screen before auto-hiding, in seconds.',
+        },
+        // Plain string (NO enum) so any custom value is accepted — Pulsar's config
+        // core rejects out-of-enum values, and stock settings-view renders an enum
+        // as a closed <select>. The preset dropdown is our own combobox (below).
+        // Default is the clean derived Chrome UA; blank falls back to it too.
+        browserUserAgent: {
+          type: 'string',
+          default: BROWSER_UA_CHROME,
+          title: 'Browser User-Agent',
+          description:
+            'Identity browser tabs send to sites. Pick a preset or type any value; blank = stock Chrome.',
         },
       },
     })
