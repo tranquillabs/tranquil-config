@@ -778,8 +778,16 @@ module.exports = {
     // window, re-hide any that get reopened on their own. Release the guard the
     // moment the user interacts (so an intentional open sticks) and, as a
     // backstop, after a few seconds — after which docks behave normally.
+    //
+    // The LEFT dock is deliberately excluded: tree-view *owns* the left dock's
+    // startup visibility and shows it asynchronously on activation (unless
+    // `tree-view.hiddenOnStartup` is set), which lands after this synchronous
+    // snapshot. In a fresh New Window the left dock is still hidden here, so
+    // guarding it would re-hide tree-view's legitimate startup open the instant
+    // it happens — leaving new windows with no tree-view. The focus-theft problem
+    // this guard exists for is a terminal/browser (bottom/right) concern, not a
+    // left-dock one.
     const hiddenAtLoad = [
-      atom.workspace.getLeftDock(),
       atom.workspace.getRightDock(),
       atom.workspace.getBottomDock(),
     ].filter((dock) => !dock.isVisible())
