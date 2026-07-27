@@ -751,7 +751,143 @@ module.exports = {
       hideVcsIgnoredFiles: true,
     })
 
+    // Drop the "Search" pane from Settings. settings-view only adds that panel
+    // (and its sidebar entry) when `enableSettingsSearch` is on, so turning the
+    // default off removes it wholesale — no post-hoc DOM surgery. Still a
+    // default, so a user can re-enable it.
+    atom.config.setDefaults('settings-view', {
+      enableSettingsSearch: false,
+    })
+
+    // Terminals belong in the bottom dock. `terminal.behavior.defaultContainer`
+    // (default 'Center' upstream) is where the package sends any terminal opened
+    // without an explicit location — `Terminal: Open`, the status-bar button, and
+    // programmatic opens. Pairs with the startup preload below.
+    atom.config.setDefaults('terminal', {
+      behavior: {
+        defaultContainer: 'Bottom Dock',
+      },
+    })
+
+    // Keep docks closed across a window reload. A dock correctly restores its
+    // pre-reload visibility (see dock.js `deserialize`), but some dock items grab
+    // DOM focus while they initialize — most notably a restored terminal, whose
+    // xterm view boots and focuses even while its dock is clipped shut — and that
+    // focus activates the dock's pane, which re-opens a dock the user had closed.
+    // Snapshot which docks restored hidden and, for the brief load-settling
+    // window, re-hide any that get reopened on their own. Release the guard the
+    // moment the user interacts (so an intentional open sticks) and, as a
+    // backstop, after a few seconds — after which docks behave normally.
+    const hiddenAtLoad = [
+      atom.workspace.getLeftDock(),
+      atom.workspace.getRightDock(),
+      atom.workspace.getBottomDock(),
+    ].filter((dock) => !dock.isVisible())
+    if (hiddenAtLoad.length) {
+      let released = false
+      let releaseTimer = null
+      const guardSubs = hiddenAtLoad.map((dock) =>
+        dock.onDidChangeVisible((visible) => {
+          if (visible && !released) dock.hide()
+        })
+      )
+      const releaseDockGuard = () => {
+        if (released) return
+        released = true
+        guardSubs.forEach((sub) => sub.dispose())
+        document.removeEventListener('mousedown', releaseDockGuard, true)
+        document.removeEventListener('keydown', releaseDockGuard, true)
+        if (releaseTimer) clearTimeout(releaseTimer)
+      }
+      document.addEventListener('mousedown', releaseDockGuard, true)
+      document.addEventListener('keydown', releaseDockGuard, true)
+      releaseTimer = setTimeout(releaseDockGuard, 5000)
+    }
+
+    // Make sure the bottom dock always has a terminal ready — but WITHOUT
+    // revealing the dock on startup. We cannot preload one eagerly: a terminal
+    // element boots as soon as it's mounted (its readiness `IntersectionObserver`
+    // uses the terminal element itself as the root, so it fires even while the
+    // dock is clipped to zero size), and on boot it calls `focusTerminal()`,
+    // which pulls DOM focus into the dock's pane, activates it, and reveals the
+    // dock. So instead we open the terminal lazily the first time the bottom
+    // dock actually becomes visible. Paired with defaultContainer='Bottom Dock'
+    // above, the dock stays closed until the user opens it, and a terminal is
+    // waiting the moment they do. Skipped when the dock already holds a terminal
+    // (e.g. restored from the last session) so we never stack a duplicate.
+    atom.workspace.getBottomDock().onDidChangeVisible((visible) => {
+      if (!visible) return
+      const bottomDock = atom.workspace.getBottomDock()
+      const hasTerminal = bottomDock
+        .getPaneItems()
+        .some(
+          (item) =>
+            item &&
+            typeof item.getURI === 'function' &&
+            String(item.getURI() || '').startsWith('terminal://')
+        )
+      if (hasTerminal) return
+      atom.workspace.open(`terminal://${crypto.randomUUID()}/`, {
+        location: 'bottom',
+      })
+    })
+
     atom.packages.disablePackage('background-tips')
+
+    // Trim the Packages menu / reduce noise: features Tranquil doesn't surface.
+    atom.packages.disablePackage('git-diff')
+    atom.packages.disablePackage('open-on-github')
+    atom.packages.disablePackage('timecop')
+    atom.packages.disablePackage('about')
+    atom.packages.disablePackage('autoflow')
+    atom.packages.disablePackage('dalek')
+    atom.packages.disablePackage('incompatible-packages')
+    atom.packages.disablePackage('package-generator')
+    atom.packages.disablePackage('styleguide')
+    atom.packages.disablePackage('pulsar-updater')
+
+    // Retire a "core" application command (one registered in Pulsar's
+    // register-default-commands.js, NOT by a package) from both the command
+    // palette and the menus. Disabling a package removes its own `pkg:*`
+    // commands and menu contributions, but core `application:*` commands tied
+    // to that feature survive on their own. `application:about` is one: with the
+    // `about` package disabled above it only opens a now-dead `atom://about`, so
+    // strip it everywhere it's still surfaced.
+    const retireCoreCommand = (command) => {
+      // Command palette: it lists `atom.commands.findCommands()` filtered by
+      // `hiddenInCommandPalette` (see command-palette-view.js). We can't
+      // unregister a core command from here, but flipping that flag on its
+      // descriptor(s) hides it from the palette while leaving the binding intact.
+      const listeners =
+        atom.commands.selectorBasedListenersByCommandName[command]
+      if (Array.isArray(listeners)) {
+        for (const listener of listeners) {
+          if (listener.descriptor) listener.descriptor.hiddenInCommandPalette = true
+        }
+      }
+      // Menus: drop every item that dispatches the command, at any depth, then
+      // ask the menu bar to rebuild.
+      const prune = (items) => {
+        if (!Array.isArray(items)) return
+        for (let i = items.length - 1; i >= 0; i--) {
+          const item = items[i]
+          if (!item) continue
+          if (item.command === command) {
+            items.splice(i, 1)
+            continue
+          }
+          if (Array.isArray(item.submenu)) prune(item.submenu)
+        }
+      }
+      prune(atom.menu.template)
+      atom.menu.update()
+    }
+    // Run now and again once initial packages have loaded, so the prune lands
+    // regardless of when the base menu template finishes building.
+    retireCoreCommand('application:about')
+    atom.packages.onDidActivateInitialPackages(() =>
+      retireCoreCommand('application:about')
+    )
 
     document.addEventListener('mousedown', (event) => {
       const treeView = event.target.closest('.tree-view')
