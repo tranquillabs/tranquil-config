@@ -835,10 +835,40 @@ module.exports = {
             String(item.getURI() || '').startsWith('terminal://')
         )
       if (hasTerminal) return
-      atom.workspace.open(`terminal://${crypto.randomUUID()}/`, {
+      // Pin the default terminal's cwd to ~/.tranquil using the `cwd` query
+      // parameter the terminal model reads off its URI. Without it, the model
+      // falls back to the active item's project root — or, in dev, the process
+      // cwd (tranquil-client) — so every fresh window opened somewhere arbitrary.
+      const cwd = encodeURIComponent(atom.getConfigDirPath())
+      atom.workspace.open(`terminal://${crypto.randomUUID()}/?cwd=${cwd}`, {
         location: 'bottom',
       })
     })
+
+    // Cmd-K clears the focused terminal, matching Terminal.app / iTerm muscle
+    // memory. This can't be a keymap binding: bare cmd-k is the pane-chord
+    // prefix (`cmd-k <arrow>`, `cmd-k cmd-w`, …), so an exact match on
+    // `pulsar-terminal` would stall in the keymap's pending state until the
+    // partial-match timeout — and shadowing the chords with `unset!` is worse,
+    // since `findPartialMatches` ignores an unset binding's keystrokes
+    // globally, killing the chords in editors too. Instead, intercept at
+    // capture phase, scoped to focus inside a terminal — the same pattern the
+    // browser package uses for its split chord. While a terminal is focused,
+    // cmd-k chords are unavailable; that's the intended trade.
+    document.addEventListener(
+      'keydown',
+      (e) => {
+        if (process.platform !== 'darwin') return
+        if (e.code !== 'KeyK' || !e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return
+        const terminal =
+          e.target instanceof Element && e.target.closest('pulsar-terminal')
+        if (!terminal) return
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        atom.commands.dispatch(terminal, 'terminal:clear')
+      },
+      true
+    )
 
     atom.packages.disablePackage('background-tips')
 
