@@ -3,20 +3,54 @@ const { ipcRenderer, shell } = require('electron')
 
 // --- Browser User-Agent presets --------------------------------------------
 // Options for the "Browser User-Agent" combobox in the Tranquil settings tab
-// (and the schema default). CHROME is the clean default: the app's own UA with
-// the Electron/Tranquil tokens stripped, so browser tabs present as plain Chrome,
-// derived at load so it tracks the bundled Chromium across upgrades — no version
-// string to rot. Edge reuses that Chromium version; Firefox/Safari are fixed
-// strings (their engine/version tokens can't be derived from Chromium — bump when
-// they drift).
-const BROWSER_UA_CHROME = navigator.userAgent.replace(/ (?:Tranquil|Electron)\/\S+/g, '')
-const BROWSER_UA_CHROME_VER = (BROWSER_UA_CHROME.match(/Chrome\/([\d.]+)/) || [, '124.0.0.0'])[1]
-const BROWSER_UA_PRESETS = [
-  { label: 'Chrome', value: BROWSER_UA_CHROME },
-  { label: 'Firefox', value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:126.0) Gecko/20100101 Firefox/126.0' },
-  { label: 'Edge', value: `${BROWSER_UA_CHROME} Edg/${BROWSER_UA_CHROME_VER}` },
-  { label: 'Safari', value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15' },
-]
+// (and the schema default). The macOS Chrome value is the clean default: the
+// app's own UA with the Electron/Tranquil tokens stripped; the other presets
+// swap the platform token.
+//
+// Version tokens are NOT the bundled Chromium's — that freezes with each
+// Electron release and ages into a bot signal (HN 429s /login for Chrome/124).
+// They come from `tranquil.browserVersions`, filled by the "Check Current
+// Versions" action in the settings tab (user-triggered fetch of the vendors'
+// official version endpoints — see 'fetch-browser-versions' in cz-init.js),
+// with pinned fallbacks for before the first check. Real Chrome reports the
+// frozen 0.0.0 minor; Firefox reports major.0. Keep the Chrome fallback in
+// sync with cleanUserAgent() in tranquil-browser/lib/utils.js.
+const UA_VERSION_FALLBACKS = { chrome: '139.0.0.0', firefox: '142.0', safari: '26.0' }
+const uaVersions = () => ({
+  ...UA_VERSION_FALLBACKS,
+  ...(atom.config.get('tranquil.browserVersions') || {}),
+})
+const UA_WINDOWS = 'Windows NT 10.0; Win64; x64'
+const UA_LINUX = 'X11; Linux x86_64'
+const buildUaPresets = () => {
+  const v = uaVersions()
+  const chromeUaFor = (platform) =>
+    `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v.chrome} Safari/537.36`
+  const firefoxUaFor = (platform) =>
+    `Mozilla/5.0 (${platform}; rv:${v.firefox}) Gecko/20100101 Firefox/${v.firefox}`
+  const chromeMac = navigator.userAgent
+    .replace(/ (?:Tranquil|Electron)\/\S+/g, '')
+    .replace(/Chrome\/[\d.]+/, `Chrome/${v.chrome}`)
+  return [
+    { label: 'Chrome — macOS', value: chromeMac },
+    { label: 'Chrome — Windows', value: chromeUaFor(UA_WINDOWS) },
+    { label: 'Chrome — Linux', value: chromeUaFor(UA_LINUX) },
+    { label: 'Firefox — macOS', value: firefoxUaFor('Macintosh; Intel Mac OS X 10.15') },
+    { label: 'Firefox — Windows', value: firefoxUaFor(UA_WINDOWS) },
+    { label: 'Firefox — Linux', value: firefoxUaFor(UA_LINUX) },
+    { label: 'Edge — macOS', value: `${chromeMac} Edg/${v.chrome}` },
+    { label: 'Edge — Windows', value: `${chromeUaFor(UA_WINDOWS)} Edg/${v.chrome}` },
+    { label: 'Safari — macOS', value: `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/${v.safari} Safari/605.1.15` },
+  ]
+}
+// Rewrite the version tokens inside an existing UA string (the user's active
+// value) after a version check; tokens that don't appear are left alone.
+const bumpUaVersions = (ua, v) =>
+  ua
+    .replace(/Chrome\/[\d.]+/, `Chrome/${v.chrome}`)
+    .replace(/Edg\/[\d.]+/, `Edg/${v.chrome}`)
+    .replace(/rv:[\d.]+/, `rv:${v.firefox}`)
+    .replace(/Firefox\/[\d.]+/, `Firefox/${v.firefox}`)
 
 // --- Markdown file links ---------------------------------------------------
 // Open the target of a Markdown link. Relative paths resolve against the source
@@ -257,6 +291,15 @@ function createTranquilSettingsPanel() {
   element.tabIndex = 0
   element.appendChild(settingsPanel.element)
 
+  // `tranquil.browserVersions` is plumbing for the UA version-check action, not
+  // a user-editable setting — SettingsPanel renders every key stored under the
+  // namespace, so drop its auto-generated sub-section once it exists.
+  const versionsEditor = element.querySelector('[id^="tranquil.browserVersions."]')
+  if (versionsEditor) {
+    const section = versionsEditor.closest('section.sub-section')
+    if (section) section.remove()
+  }
+
   // Surface the UI theme picker (normally buried in settings-view's Themes panel)
   // at the top of Tranquil Settings. Self-contained: reads/writes core.themes
   // directly, so it needs nothing from settings-view. Built with the same
@@ -418,6 +461,7 @@ function createTranquilSettingsPanel() {
   // preset list is our own DOM because stock settings-view can't render an
   // editable dropdown.
   let uaConfigSub = null
+  let uaVersionsSub = null
   let uaDocMouseDown = null
   const uaEditor = element.querySelector('[id="tranquil.browserUserAgent"]')
   const uaControls = uaEditor && uaEditor.closest('.controls')
@@ -451,15 +495,31 @@ function createTranquilSettingsPanel() {
     list.id = 'tq-ua-listbox'
     list.setAttribute('role', 'listbox')
     list.hidden = true
-    for (const preset of BROWSER_UA_PRESETS) {
-      const li = document.createElement('li')
-      li.setAttribute('role', 'option')
-      li.dataset.ua = preset.value
-      li.textContent = preset.label
-      list.appendChild(li)
+    // Rebuilt (not static) so a version check refreshes the preset values.
+    const renderPresets = () => {
+      list.textContent = ''
+      for (const preset of buildUaPresets()) {
+        const li = document.createElement('li')
+        li.setAttribute('role', 'option')
+        li.dataset.ua = preset.value
+        li.textContent = preset.label
+        list.appendChild(li)
+      }
+    }
+    renderPresets()
+
+    // Mark the preset row matching the current value (themes render a checkmark
+    // via [aria-selected]) — the UA strings all share the same visible prefix in
+    // the field, so this is what makes the active choice legible.
+    const syncSelected = () => {
+      const current = input.value.trim()
+      for (const li of list.children) {
+        li.setAttribute('aria-selected', li.dataset.ua === current ? 'true' : 'false')
+      }
     }
 
     const openList = () => {
+      syncSelected()
       list.hidden = false
       input.setAttribute('aria-expanded', 'true')
     }
@@ -504,6 +564,105 @@ function createTranquilSettingsPanel() {
     combo.appendChild(list)
     const editorContainer = uaEditor.closest('.editor-container') || uaEditor
     editorContainer.replaceWith(combo)
+
+    // "Check Current Versions": user-triggered fetch of the latest stable
+    // Chrome/Firefox versions (main process — 'fetch-browser-versions' in
+    // cz-init.js; nothing is fetched automatically). The result is stored in
+    // tranquil.browserVersions, the presets rebuild from it, and the version
+    // tokens in the active value are bumped in place so it applies live.
+    const versionRow = document.createElement('div')
+    versionRow.classList.add('tq-ua-version-row')
+
+    const checkButton = document.createElement('button')
+    checkButton.type = 'button'
+    checkButton.classList.add('btn')
+    checkButton.textContent = 'Get current UA'
+
+    const versionStatus = document.createElement('span')
+    versionStatus.classList.add('tq-ua-version-status')
+    const versionHint = document.createElement('span')
+    versionHint.classList.add('tq-ua-version-hint')
+    versionHint.hidden = true
+    const describeVersions = () => {
+      const v = uaVersions()
+      const stored = atom.config.get('tranquil.browserVersions') || {}
+      // Dates arrive as YYYY-MM-DD (or ISO datetimes); pin to midday so the
+      // local rendering can't slip a day across timezones.
+      const midday = (iso) => new Date(String(iso).slice(0, 10) + 'T12:00:00')
+      const fmtDay = (iso) =>
+        midday(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+      const chromePart =
+        `Chrome ${v.chrome.split('.')[0]}` +
+        (stored.chromeReleased ? ` (${fmtDay(stored.chromeReleased)})` : '')
+      const firefoxPart =
+        `Firefox ${v.firefox.split('.')[0]}` +
+        (stored.firefoxReleased ? ` (${fmtDay(stored.firefoxReleased)})` : '')
+      const source = stored.checkedAt
+        ? `checked ${fmtDay(stored.checkedAt)}`
+        : 'built-in'
+      versionStatus.textContent = `${chromePart} · ${firefoxPart} — ${source}`
+
+      // Staleness hint: Firefox publishes its next release date outright;
+      // Chrome ships on a ~4-week cadence, so infer from the release date of
+      // the version we hold. Purely informational — nothing refetches.
+      let hint = ''
+      if (stored.checkedAt) {
+        const CHROME_CADENCE_MS = 28 * 24 * 60 * 60 * 1000
+        const chromeStale =
+          stored.chromeReleased &&
+          Date.now() - midday(stored.chromeReleased).getTime() > CHROME_CADENCE_MS
+        const firefoxStale =
+          stored.firefoxNextRelease &&
+          Date.now() > midday(stored.firefoxNextRelease).getTime()
+        if (chromeStale || firefoxStale) {
+          hint = 'Newer versions have likely shipped — check again'
+        }
+      }
+      versionHint.textContent = hint
+      versionHint.hidden = !hint
+    }
+    describeVersions()
+
+    checkButton.addEventListener('click', () => {
+      checkButton.disabled = true
+      versionStatus.textContent = 'Checking…'
+      ipcRenderer
+        .invoke('fetch-browser-versions')
+        .then((fetched) => {
+          atom.config.set('tranquil.browserVersions', {
+            ...fetched,
+            checkedAt: new Date().toISOString(),
+          })
+          const current = (atom.config.get(KEY) || '').trim()
+          if (current) {
+            const bumped = bumpUaVersions(current, uaVersions())
+            if (bumped !== current) atom.config.set(KEY, bumped)
+          }
+          describeVersions()
+        })
+        .catch((e) => {
+          versionStatus.textContent = `Check failed: ${e.message.replace(/^Error invoking remote method '[^']+': */, '')}`
+        })
+        .finally(() => {
+          checkButton.disabled = false
+        })
+    })
+
+    versionRow.appendChild(checkButton)
+    versionRow.appendChild(versionStatus)
+    versionRow.appendChild(versionHint)
+    // Direct child of the .control-group — the themes lay that out as a column
+    // (label / controls / this row, via order), so the row gets its own line
+    // below the field like every other setting's second row.
+    const uaGroup = uaControls.closest('.control-group') || uaControls.parentElement
+    uaGroup.appendChild(versionRow)
+
+    // Keep this window's presets/status in step when the versions change (this
+    // window's check or another's — config syncs across windows).
+    uaVersionsSub = atom.config.onDidChange('tranquil.browserVersions', () => {
+      renderPresets()
+      describeVersions()
+    })
   }
 
   return {
@@ -513,6 +672,7 @@ function createTranquilSettingsPanel() {
     destroy() {
       if (durationConfigSub) durationConfigSub.dispose()
       if (uaConfigSub) uaConfigSub.dispose()
+      if (uaVersionsSub) uaVersionsSub.dispose()
       if (uaDocMouseDown) document.removeEventListener('mousedown', uaDocMouseDown, true)
       if (uiThemeSub) uiThemeSub.dispose()
       if (settingsPanel.destroy) settingsPanel.destroy()
@@ -721,7 +881,7 @@ module.exports = {
         // Default is the clean derived Chrome UA; blank falls back to it too.
         browserUserAgent: {
           type: 'string',
-          default: BROWSER_UA_CHROME,
+          default: buildUaPresets()[0].value,
           title: 'Browser User-Agent',
           description:
             'Identity browser tabs send to sites. Pick a preset or type any value; blank = stock Chrome.',
