@@ -725,14 +725,6 @@ function addTranquilPanel(settingsView) {
 
 module.exports = {
   activate() {
-    // "File → New Default Window" → ask the main process to seed (if needed) and
-    // open the bundled example project in a new window. Classic Electron IPC,
-    // matching the browser's new-window command.
-    atom.commands.add('atom-workspace', {
-      'tranquil:new-default-window': () =>
-        ipcRenderer.send('tranquil:new-default-window'),
-    })
-
     // Ctrl+Tab always cycles the CENTER's tabs, even when focus is in a dock.
     // Core `pane:show-next-item` acts on `workspace.getActivePane()`, which
     // follows the active pane *container* — so clicking the tree-view (left
@@ -759,39 +751,6 @@ module.exports = {
       'tranquil:show-previous-item-in-center': () =>
         cycleCenterItem('activatePreviousItem'),
     })
-
-    // Place "New Default Window" as the SECOND File-menu item (right after "New
-    // Window"). A package `menus/*.cson` contribution can't do this — the app-menu
-    // merge only appends to the bottom — so insert it into the menu template
-    // directly. Idempotent; located by the `application:new-window` command so it
-    // works across darwin/linux/win32 without matching the (accelerator-decorated)
-    // "File" label.
-    const placeNewDefaultWindowItem = () => {
-      const fileMenu = atom.menu.template.find(
-        (m) =>
-          Array.isArray(m.submenu) &&
-          m.submenu.some((i) => i && i.command === 'application:new-window')
-      )
-      if (!fileMenu) return
-      if (
-        fileMenu.submenu.some(
-          (i) => i && i.command === 'tranquil:new-default-window'
-        )
-      )
-        return
-      const afterIdx = fileMenu.submenu.findIndex(
-        (i) => i && i.command === 'application:new-window'
-      )
-      fileMenu.submenu.splice(afterIdx + 1, 0, {
-        label: 'New Default Window',
-        command: 'tranquil:new-default-window',
-      })
-      atom.menu.update()
-    }
-    // Run now (template is usually built by activation time) and again once all
-    // initial packages have loaded, so it lands regardless of menu-load ordering.
-    placeNewDefaultWindowItem()
-    atom.packages.onDidActivateInitialPackages(placeNewDefaultWindowItem)
 
     // Let editor tabs be dragged into the right/bottom docks, matching browser
     // tabs. Core `TextEditor.getAllowedLocations()` returns `['center']`, so a

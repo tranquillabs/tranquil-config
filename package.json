@@ -1,10 +1,13 @@
 {
   "name": "tranquil-config",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "main": "./src/index",
   "description": "Manage configuration and settings",
   "repository": "https://github.com/tranquillabs/tranquil-client",
-  "author": { "name": "Tranquil Labs", "url": "https://github.com/tranquillabs" },
+  "author": {
+    "name": "Tranquil Labs",
+    "url": "https://github.com/tranquillabs"
+  },
   "license": "MIT",
   "engines": {
     "atom": "*"
