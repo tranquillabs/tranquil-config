@@ -752,6 +752,21 @@ module.exports = {
         cycleCenterItem('activatePreviousItem'),
     })
 
+    // Safety net: `atom-workspace` must never sit scrolled. It is `overflow: hidden`,
+    // which still makes it a scroll container — just one with no scrollbar, so once
+    // something scrolls it there is no way back and the whole UI stays displaced (docks
+    // sliced off one edge, dead space at the other). Any `scrollIntoView()` or `focus()`
+    // landing on a descendant that has spilled outside the window does it; the tab bar
+    // overflowing on a crowded pane was the one we hit, fixed at the source in the
+    // business themes' `.tab-bar`. Snap it home rather than trust every third-party
+    // package to stay inside its box. `scroll` doesn't bubble, so this listener only
+    // fires for atom-workspace's own scrolling — descendant scrolling never reaches it.
+    const workspaceEl = atom.views.getView(atom.workspace)
+    workspaceEl.addEventListener('scroll', () => {
+      if (workspaceEl.scrollLeft !== 0) workspaceEl.scrollLeft = 0
+      if (workspaceEl.scrollTop !== 0) workspaceEl.scrollTop = 0
+    })
+
     // Let editor tabs be dragged into the right/bottom docks, matching browser
     // tabs. Core `TextEditor.getAllowedLocations()` returns `['center']`, so a
     // dock refuses an editor on drop (`isItemAllowed()` in dock.js). Override it
