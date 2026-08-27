@@ -752,6 +752,29 @@ module.exports = {
         cycleCenterItem('activatePreviousItem'),
     })
 
+    // Cmd-W closes the tab you are actually looking at, dock or not. Core's `core:close` runs
+    // `workspace.closeActivePaneItemOrEmptyPaneOrWindow()`, which reads `getCenter()`
+    // unconditionally (src/workspace.js) and ignores the active pane container — so with focus
+    // in the right or bottom dock it destroys a CENTER tab, closing something the user can't
+    // even see. Upstream docks held tool panels; ours hold browser tabs and editors, which are
+    // closable documents like any other.
+    //
+    // Same selector as core's registration, so this runs first (equal specificity → most
+    // recently registered wins) and stops it. The center is left entirely to core: no dock
+    // focus, no behavior change — including the close-empty-window path. Destroying the item is
+    // exactly what the tab's own × does, so an emptied dock hides itself (dock.js
+    // handleDidRemovePaneItem) as usual.
+    atom.commands.add('atom-workspace', 'core:close', (event) => {
+      const container = atom.workspace.getActivePaneContainer()
+      if (!container || container === atom.workspace.getCenter()) return
+      const pane = container.getActivePane()
+      // An empty (or hidden-and-emptied) dock has nothing to close — fall through to core
+      // rather than swallow the key.
+      if (!pane || !pane.getActiveItem()) return
+      event.stopImmediatePropagation()
+      pane.destroyActiveItem()
+    })
+
     // Safety net: `atom-workspace` must never sit scrolled. It is `overflow: hidden`,
     // which still makes it a scroll container — just one with no scrollbar, so once
     // something scrolls it there is no way back and the whole UI stays displaced (docks
