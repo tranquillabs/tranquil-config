@@ -1,5 +1,6 @@
 const path = require('path')
 const { ipcRenderer, shell } = require('electron')
+const { startRendererStallWatchdog } = require('./stall-watchdog')
 
 // --- Browser User-Agent presets --------------------------------------------
 // Options for the "Browser User-Agent" combobox in the Tranquil settings tab
@@ -725,6 +726,11 @@ function addTranquilPanel(settingsView) {
 
 module.exports = {
   activate() {
+    // Freeze diagnostics: report a stalled renderer thread in this window. Catches the band
+    // below Chromium's ~30s hang threshold, where no 'unresponsive' event ever fires. See
+    // stall-watchdog.js; the main-process half lives in tranquil-client.
+    startRendererStallWatchdog()
+
     // Ctrl+Tab always cycles the CENTER's tabs, even when focus is in a dock.
     // Core `pane:show-next-item` acts on `workspace.getActivePane()`, which
     // follows the active pane *container* — so clicking the tree-view (left
