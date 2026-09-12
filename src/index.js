@@ -861,6 +861,112 @@ module.exports = {
       })
     })
 
+    // "Toggle Markdown Preview" replaces the tab in place (VS Code's "Reopen
+    // Editor With: Markdown Preview" / "Text Editor" feel) instead of opening a
+    // second tab. Pulsar's pane-item model has no same-tab/different-renderer
+    // concept, so we simulate it: on toggle, swap the editor out of the pane
+    // for a preview view at the same index (keeping the live editor only in a
+    // WeakMap), and swap back on the next toggle. The on-screen way back is
+    // tranquil-automations' existing tab-bar "Toggle Markdown Preview" pane
+    // control (markdown-preview-control.js) — its matcher already covers the
+    // preview view (same grammar, borrowed from the source editor), so the
+    // same button works from either side without any UI of our own here.
+    //
+    // Intercepted via onWillDispatch + stopImmediatePropagation rather than
+    // re-registering on markdown-preview's own dynamic per-grammar selector
+    // (`atom-text-editor[data-grammar='...']`, rebuilt on config change) —
+    // will-dispatch fires before ANY selector-based listener for the event, so
+    // suppressing it here always wins regardless of specificity or package
+    // activation order, for every trigger path (keymap, menu, palette).
+    //
+    // Tradeoff: while an editor is swapped out, it isn't attached to any pane,
+    // so Tranquil's close-time "save changes?" sweep (workspace.confirmClose,
+    // which walks pane items) won't prompt for it. The underlying TextBuffer
+    // stays registered with the project either way (reopening the file finds
+    // it and its unsaved text again), so this only risks losing that specific
+    // editor's cursor/scroll/undo history, not the edited content itself.
+    const previewToSource = new WeakMap() // preview view -> {editor, pane, index}
+
+    const isMarkdownPreviewView = (item) =>
+      !!item && item.constructor && item.constructor.name === 'MarkdownPreviewView'
+
+    // Swap a preview (still alive and attached) back to its source editor, at
+    // the same pane index, then destroy the preview.
+    const swapToSource = (preview) => {
+      const info = previewToSource.get(preview)
+      if (!info) return
+      previewToSource.delete(preview)
+      if (info.pane.isDestroyed()) return
+      const { editor, pane, index } = info
+      // moved:true — this editor was detached with moved:true, which (by
+      // design; see Pane::removeItem) skips telling the workspace-wide
+      // ItemRegistry it left. Re-adding it as a "new" item without moved:true
+      // makes the registry see a duplicate and throw ("can only contain one
+      // instance of item"), which also aborts this function before the
+      // destroyItem below runs — leaving both the editor AND the preview tab
+      // on screen. Symmetric moved:true on both ends keeps the registry (and
+      // this function) consistent.
+      pane.addItem(editor, { index, moved: true })
+      pane.activateItem(editor)
+      atom.views.getView(pane).focus()
+      pane.destroyItem(preview)
+    }
+
+    // Swap the active markdown editor to a preview at the same pane index.
+    // Returns false (leaving stock's own handler to run) if anything about the
+    // active context doesn't fit — no editor, wrong grammar, no pane, or
+    // markdown-preview's internals ever change shape.
+    const swapToPreview = (editor) => {
+      const grammars = atom.config.get('markdown-preview.grammars') || []
+      if (!grammars.includes(editor.getGrammar().scopeName)) return false
+      const pane = atom.workspace.paneForItem(editor)
+      if (!pane) return false
+      const mdPreview = atom.packages.getActivePackage('markdown-preview')
+      const createView =
+        mdPreview && mdPreview.mainModule && mdPreview.mainModule.createMarkdownPreviewView
+      if (typeof createView !== 'function') return false
+      const preview = createView.call(mdPreview.mainModule, { editorId: editor.id })
+      if (!preview) return false
+
+      const index = pane.getItems().indexOf(editor)
+      previewToSource.set(preview, { editor, pane, index })
+      pane.removeItem(editor, true) // moved:true — relocated, not closed (keeps Reopen Last Item honest)
+      pane.addItem(preview, { index })
+      pane.activateItem(preview)
+      atom.views.getView(pane).focus()
+      return true
+    }
+
+    // Safety net for closing the preview some OTHER way (its tab's ×, etc.)
+    // instead of toggling back — restore the source editor either way, so the
+    // file never just vanishes from the pane.
+    atom.workspace.onDidDestroyPaneItem(({ item, pane, index }) => {
+      const info = previewToSource.get(item)
+      if (!info) return
+      previewToSource.delete(item)
+      if (pane.isDestroyed()) return
+      pane.addItem(info.editor, { index, moved: true }) // see moved:true note in swapToSource
+      pane.activateItem(info.editor)
+      atom.views.getView(pane).focus()
+    })
+
+    atom.commands.onWillDispatch((event) => {
+      if (event.type !== 'markdown-preview:toggle') return
+      const active = atom.workspace.getActivePaneItem()
+
+      // Preview is showing (and it's one of ours) — swap the source back in.
+      if (isMarkdownPreviewView(active) && previewToSource.has(active)) {
+        event.stopImmediatePropagation()
+        swapToSource(active)
+        return
+      }
+
+      // Otherwise, only handle the case stock would: an active markdown editor.
+      const editor = atom.workspace.getActiveTextEditor()
+      if (!editor) return
+      if (swapToPreview(editor)) event.stopImmediatePropagation()
+    })
+
     // Tranquil's own config namespace (`tranquil.*`), surfaced in the "Tranquil"
     // settings tab below. Registered here (not via package.json configSchema) so
     // the keys live under `tranquil.*` rather than the package name.
@@ -920,6 +1026,13 @@ module.exports = {
     // default, so a user can re-enable it.
     atom.config.setDefaults('settings-view', {
       enableSettingsSearch: false,
+    })
+
+    // "Toggle Markdown Preview" replaces the tab in place instead of splitting
+    // the pane. Upstream's own flag for this (see markdown-preview/lib/main.js
+    // addPreviewForEditor) — just flipping the default a user can still override.
+    atom.config.setDefaults('markdown-preview', {
+      openPreviewInSplitPane: false,
     })
 
     // Terminals belong in the bottom dock. `terminal.behavior.defaultContainer`
