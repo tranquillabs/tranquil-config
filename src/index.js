@@ -78,6 +78,70 @@ function openMarkdownLinkTarget(target, sourcePath) {
   if (filePart) atom.workspace.open(path.resolve(base, filePart))
 }
 
+// --- Terminal Cmd/Ctrl-click links ------------------------------------------
+// Same treatment as Markdown links below: open URLs clicked in the terminal
+// package (upstream, in node_modules/ — not ours to edit) as a Tranquil
+// browser tab instead of shelling out to the OS default browser. There's no
+// config hook or service to swap terminal's own click behavior — it hardcodes
+// `shell.openExternal` inside its xterm WebLinksAddon handler — so intercept
+// the click a layer up instead, on the pane item's own element, the same
+// capture-phase-listener-plus-preventDefault technique used for Markdown
+// preview links below. Detecting the URL under the cursor uses only
+// @xterm/xterm's public Terminal API (`element`, `cols`, `rows`,
+// `buffer.active`) — no reach into the addon or terminal package internals —
+// and `atom.config.get('terminal.behavior.requireModifierToOpenUrls')` to
+// track the user's own modifier-gate setting. When that setting is on
+// (default) and the click has no modifier, we don't intercept at all, so
+// terminal's own click-without-modifier notice still fires unchanged.
+const TERMINAL_URL_REGEX = /(https?):\/\/[^\s"'!*(){}|\\^<>`]*[^\s"':,.!?{}|\\^~[\]`()<>]/g
+
+function terminalUrlAtMouseEvent(xterm, event) {
+  if (!xterm || !xterm.element) return null
+  const rect = xterm.element.getBoundingClientRect()
+  const col = Math.floor((event.clientX - rect.left) / (rect.width / xterm.cols))
+  const row = Math.floor((event.clientY - rect.top) / (rect.height / xterm.rows))
+  if (col < 0 || row < 0 || col >= xterm.cols || row >= xterm.rows) return null
+  const buffer = xterm.buffer.active
+  const line = buffer.getLine(buffer.viewportY + row)
+  if (!line) return null
+  const text = line.translateToString(true)
+  TERMINAL_URL_REGEX.lastIndex = 0
+  let match
+  while ((match = TERMINAL_URL_REGEX.exec(text))) {
+    if (col >= match.index && col < match.index + match[0].length) return match[0]
+  }
+  return null
+}
+
+function observeTerminalLinks() {
+  atom.workspace.observePaneItems((item) => {
+    if (!item || !item.constructor || item.constructor.name !== 'TerminalModel') return
+    // `item.getElement()` only returns something once terminal's own view
+    // provider has actually run `initialize()` on an element for this model,
+    // which may not have happened yet at item-add time — `atom.views.getView`
+    // is Atom's public model->view resolver; it creates (and caches) the view
+    // right now if nothing has, so we always get a real, attachable element.
+    const el = atom.views.getView(item)
+    if (!(el instanceof HTMLElement) || el.__tranquilTerminalLinks) return
+    el.__tranquilTerminalLinks = true
+    el.addEventListener(
+      'mousedown',
+      (event) => {
+        if (event.button !== 0) return
+        const requireModifier = atom.config.get('terminal.behavior.requireModifierToOpenUrls')
+        const modifier = process.platform === 'darwin' ? event.metaKey : event.ctrlKey
+        if (requireModifier && !modifier) return
+        const url = terminalUrlAtMouseEvent(el.terminal, event)
+        if (!url) return
+        event.preventDefault()
+        event.stopPropagation()
+        atom.workspace.open(url)
+      },
+      true // capture phase, to beat xterm's own mousedown handling
+    )
+  })
+}
+
 // Find the inline Markdown link `[text](target)` whose span covers `column`.
 // Returns the target string, or null.
 function markdownLinkTargetAt(lineText, column) {
@@ -730,6 +794,8 @@ module.exports = {
     // below Chromium's ~30s hang threshold, where no 'unresponsive' event ever fires. See
     // stall-watchdog.js; the main-process half lives in tranquil-client.
     startRendererStallWatchdog()
+
+    observeTerminalLinks()
 
     // Ctrl+Tab always cycles the CENTER's tabs, even when focus is in a dock.
     // Core `pane:show-next-item` acts on `workspace.getActivePane()`, which
