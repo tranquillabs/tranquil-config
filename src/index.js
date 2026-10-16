@@ -2,6 +2,53 @@ const path = require('path')
 const { ipcRenderer, shell } = require('electron')
 const { startRendererStallWatchdog } = require('./stall-watchdog')
 
+// --- The `tranquil` settings namespace --------------------------------------
+// This package owns the app-wide `tranquil.*` settings (Settings → Tranquil), registered in
+// activate() under the namespace rather than the package name. Every key here is built by
+// tranquilKey(), which only accepts a name declared in TRANQUIL_SETTINGS, so a misspelled key
+// throws instead of silently reading undefined. tranquil-browser and tranquil-automations read
+// some of these by name too (their lib/settings.js).
+const NAMESPACE = 'tranquil'
+const TRANQUIL_SETTINGS = {
+  // NB: no `minimum`/`maximum` here on purpose. settings-view clamps integer fields to those
+  // bounds on every keystroke pause and rewrites the input, which makes typing a new value
+  // impossible (intermediate digits below the min snap back). A sane floor is enforced where
+  // the value is consumed instead.
+  toastDuration: {
+    type: 'integer',
+    default: 3000,
+    title: 'Toast Duration',
+    description:
+      'How long transient corner notifications (toasts) stay on screen before auto-hiding, in seconds.',
+  },
+  // Plain string (NO enum) so any custom value is accepted: Pulsar's config core rejects
+  // out-of-enum values, and stock settings-view renders an enum as a closed <select>. The preset
+  // dropdown is our own combobox. Its default (the clean derived Chrome UA) is filled in at
+  // activation, since it depends on the stored browser versions; blank falls back to it too.
+  browserUserAgent: {
+    type: 'string',
+    default: '',
+    title: 'Browser User-Agent',
+    description:
+      'Identity browser tabs send to sites. Pick a preset or type any value; blank = stock Chrome.',
+  },
+  // Plumbing for the "Check Current Versions" action: the latest stable versions it fetched.
+  // Hidden in the settings tab.
+  browserVersions: {
+    type: 'object',
+    default: {},
+    title: 'Browser Versions',
+    description: 'Latest stable browser versions, filled by Check Current Versions.',
+  },
+}
+
+function tranquilKey(name) {
+  if (!Object.prototype.hasOwnProperty.call(TRANQUIL_SETTINGS, name)) {
+    throw new Error(`tranquil-config: "${name}" is not a ${NAMESPACE} setting`)
+  }
+  return `${NAMESPACE}.${name}`
+}
+
 // --- Browser User-Agent presets --------------------------------------------
 // Options for the "Browser User-Agent" combobox in the Tranquil settings tab
 // (and the schema default). The macOS Chrome value is the clean default: the
@@ -19,7 +66,7 @@ const { startRendererStallWatchdog } = require('./stall-watchdog')
 const UA_VERSION_FALLBACKS = { chrome: '139.0.0.0', firefox: '142.0', safari: '26.0' }
 const uaVersions = () => ({
   ...UA_VERSION_FALLBACKS,
-  ...(atom.config.get('tranquil.browserVersions') || {}),
+  ...(atom.config.get(tranquilKey('browserVersions')) || {}),
 })
 const UA_WINDOWS = 'Windows NT 10.0; Win64; x64'
 const UA_LINUX = 'X11; Linux x86_64'
@@ -340,13 +387,13 @@ function createTranquilSettingsPanel() {
   // keystroke pause and rewrites the input, so a value can't be typed freely
   // (settings-panel.js reads the schema live in its change handler). Strip those
   // bounds off the live schema so the field accepts any value.
-  const durationSchema = atom.config.getSchema('tranquil.toastDuration')
+  const durationSchema = atom.config.getSchema(tranquilKey('toastDuration'))
   if (durationSchema) {
     delete durationSchema.minimum
     delete durationSchema.maximum
   }
   const settingsPanel = new SettingsPanel({
-    namespace: 'tranquil',
+    namespace: NAMESPACE,
     icon: 'gear',
     title: 'Tranquil Settings',
   })
@@ -359,7 +406,7 @@ function createTranquilSettingsPanel() {
   // `tranquil.browserVersions` is plumbing for the UA version-check action, not
   // a user-editable setting — SettingsPanel renders every key stored under the
   // namespace, so drop its auto-generated sub-section once it exists.
-  const versionsEditor = element.querySelector('[id^="tranquil.browserVersions."]')
+  const versionsEditor = element.querySelector(`[id^="${tranquilKey('browserVersions')}."]`)
   if (versionsEditor) {
     const section = versionsEditor.closest('section.sub-section')
     if (section) section.remove()
@@ -472,7 +519,7 @@ function createTranquilSettingsPanel() {
   // input (integer value + increment/decrement steppers), bound to config, and
   // add a "Test" button beside it that previews a toast at the current value.
   let durationConfigSub = null
-  const durationEditor = element.querySelector('[id="tranquil.toastDuration"]')
+  const durationEditor = element.querySelector(`[id="${tranquilKey('toastDuration')}"]`)
   const durationControls = durationEditor && durationEditor.closest('.controls')
   if (durationControls) {
     // The field shows whole SECONDS (a friendly integer for the stepper); the
@@ -485,13 +532,13 @@ function createTranquilSettingsPanel() {
     numberInput.classList.add('tranquil-number-input', 'native-key-bindings')
     numberInput.min = '1'
     numberInput.step = '1'
-    numberInput.value = String(msToSeconds(atom.config.get('tranquil.toastDuration')))
+    numberInput.value = String(msToSeconds(atom.config.get(tranquilKey('toastDuration'))))
     numberInput.addEventListener('input', () => {
       const seconds = parseInt(numberInput.value, 10)
-      if (Number.isFinite(seconds)) atom.config.set('tranquil.toastDuration', seconds * 1000)
+      if (Number.isFinite(seconds)) atom.config.set(tranquilKey('toastDuration'), seconds * 1000)
     })
     // Reflect external config changes, but don't fight the user while they type.
-    durationConfigSub = atom.config.onDidChange('tranquil.toastDuration', ({ newValue }) => {
+    durationConfigSub = atom.config.onDidChange(tranquilKey('toastDuration'), ({ newValue }) => {
       if (document.activeElement !== numberInput) numberInput.value = String(msToSeconds(newValue))
     })
 
@@ -528,10 +575,10 @@ function createTranquilSettingsPanel() {
   let uaConfigSub = null
   let uaVersionsSub = null
   let uaDocMouseDown = null
-  const uaEditor = element.querySelector('[id="tranquil.browserUserAgent"]')
+  const uaEditor = element.querySelector(`[id="${tranquilKey('browserUserAgent')}"]`)
   const uaControls = uaEditor && uaEditor.closest('.controls')
   if (uaControls) {
-    const KEY = 'tranquil.browserUserAgent'
+    const KEY = tranquilKey('browserUserAgent')
 
     const combo = document.createElement('div')
     combo.classList.add('tq-ua-combobox')
@@ -650,7 +697,7 @@ function createTranquilSettingsPanel() {
     versionHint.hidden = true
     const describeVersions = () => {
       const v = uaVersions()
-      const stored = atom.config.get('tranquil.browserVersions') || {}
+      const stored = atom.config.get(tranquilKey('browserVersions')) || {}
       // Dates arrive as YYYY-MM-DD (or ISO datetimes); pin to midday so the
       // local rendering can't slip a day across timezones.
       const midday = (iso) => new Date(String(iso).slice(0, 10) + 'T12:00:00')
@@ -694,7 +741,7 @@ function createTranquilSettingsPanel() {
       ipcRenderer
         .invoke('fetch-browser-versions')
         .then((fetched) => {
-          atom.config.set('tranquil.browserVersions', {
+          atom.config.set(tranquilKey('browserVersions'), {
             ...fetched,
             checkedAt: new Date().toISOString(),
           })
@@ -724,7 +771,7 @@ function createTranquilSettingsPanel() {
 
     // Keep this window's presets/status in step when the versions change (this
     // window's check or another's — config syncs across windows).
-    uaVersionsSub = atom.config.onDidChange('tranquil.browserVersions', () => {
+    uaVersionsSub = atom.config.onDidChange(tranquilKey('browserVersions'), () => {
       renderPresets()
       describeVersions()
     })
@@ -1033,43 +1080,18 @@ module.exports = {
       if (swapToPreview(editor)) event.stopImmediatePropagation()
     })
 
-    // Tranquil's own config namespace (`tranquil.*`), surfaced in the "Tranquil"
-    // settings tab below. Registered here (not via package.json configSchema) so
-    // the keys live under `tranquil.*` rather than the package name.
-    // NB: no `minimum`/`maximum` here on purpose. settings-view clamps integer
-    // fields to those bounds on every keystroke pause and rewrites the input,
-    // which makes typing a new value impossible (intermediate digits below the
-    // min snap back). We enforce a sane floor where the value is consumed instead.
-    atom.config.setSchema('tranquil', {
-      type: 'object',
-      properties: {
-        toastDuration: {
-          type: 'integer',
-          default: 3000,
-          title: 'Toast Duration',
-          description:
-            'How long transient corner notifications (toasts) stay on screen before auto-hiding, in seconds.',
-        },
-        // Plain string (NO enum) so any custom value is accepted — Pulsar's config
-        // core rejects out-of-enum values, and stock settings-view renders an enum
-        // as a closed <select>. The preset dropdown is our own combobox (below).
-        // Default is the clean derived Chrome UA; blank falls back to it too.
-        browserUserAgent: {
-          type: 'string',
-          default: buildUaPresets()[0].value,
-          title: 'Browser User-Agent',
-          description:
-            'Identity browser tabs send to sites. Pick a preset or type any value; blank = stock Chrome.',
-        },
-      },
-    })
+    // Tranquil's own config namespace (`tranquil.*`), surfaced in the "Tranquil" settings tab
+    // below. Registered here (not via package.json configSchema) so the keys live under
+    // `tranquil.*` rather than the package name. Declared once, in TRANQUIL_SETTINGS.
+    TRANQUIL_SETTINGS.browserUserAgent.default = buildUaPresets()[0].value
+    atom.config.setSchema(NAMESPACE, { type: 'object', properties: TRANQUIL_SETTINGS })
 
     // The `notify()` helpers in tranquil-automations / tranquil-browser read
     // `tranquil.toastDuration` directly. Bridge it one-way to the core
     // notifications timeout too, so the handful of direct `atom.notifications.add*`
     // callers (tranquil-drag-drop, tranquil-window-color) honor the same setting.
     // Clamp to the notifications schema's own minimum (1000) so the write sticks.
-    atom.config.observe('tranquil.toastDuration', (value) => {
+    atom.config.observe(tranquilKey('toastDuration'), (value) => {
       const ms = Math.max(1000, Number(value) || 3000)
       atom.config.set('notifications.defaultTimeout', ms)
     })
